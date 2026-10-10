@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iddaa 13 Kuralı - Canlı Basketbol Barem Uyarısı
 // @namespace    iddaa-13-kurali
-// @version      3.4
+// @version      3.5
 // @description  Canlı basketbol "Toplam Sayı Alt/Üst": canlı uç barem, referans uç baremden (maç öncesi / 5. dk / 1. çeyrek sonu) FARK kadar sapınca sanal kupon (Ters) + maç öncesi için Telegram uyarısı.
 // @match        https://www.iddaa.com/*
 // @grant        none
@@ -42,7 +42,7 @@
   if (window.top !== window || window.__iddaa13) return;
   window.__iddaa13 = true;
 
-  const VERSIYON = '3.4';
+  const VERSIYON = '3.5';
   const API = 'https://sportsbookv2.iddaa.com/sportsbook';
   const SR = 'https://stats.fn.sportradar.com/sansgirisimnew/tr/Europe:Istanbul/gismo'; // iddaa'nın kullandığı Sportradar verisi
   const WS_ORAN = 'wss://sportsbooksocket.iddaa.com/sportsBookHubLite';  // currentOdds / currentEvents
@@ -601,7 +601,7 @@
     }
   });
 
-  // ---------- liste fonksiyonları (panel + CSV) ----------
+  // ---------- liste fonksiyonları (panel + Excel) ----------
   function sanalListe() {
     const out = [];
     for (const [id, k] of Object.entries(db.mac)) {
@@ -632,22 +632,103 @@
     }
     return satirlar;
   }
-  function sanalCSV() {
-    const bas = ['zaman', 'mac_id', 'mac', 'lig', 'esik', 'mac_dakikasi', 'gecen_sure', 'ceyrek', 'ceyrek_kalan', 'barem_yonu',
-      'mac_oncesi_ana', 'mac_oncesi_en_alt', 'mac_oncesi_en_ust', 'karsilastirilan', 'fark', 'skor_aninda',
-      'taraf', 'barem', 'oran', 'mbs', 'toplam_sayi', 'sonuc', 'net_tl', 'kontrol_et', 'sonuc_kaynagi', 'veri_kaynagi',
-      'referans', 'referans_gecen_sure', 'referans_en_alt', 'referans_en_ust'];   // v3.4: yeni sütunlar sonda (eski dosyalarla uyumlu)
-    const sat = [bas.join(';')];
-    for (const b of sanalListe()) {
-      const x = b.ters;
-      sat.push([new Date(b.t).toLocaleString('tr-TR'), b.id, b.mac, b.lig || '', b.esik, b.dk ?? '', b.gecen || '', b.ceyrek ?? '', b.ceyrekKalan || b.kalan || '',
-        b.yon === 'ust' ? 'yukari' : 'asagi', b.pre ?? '', b.preAlt ?? '', b.preUst ?? '', b.preRef ?? '', b.fark, b.skor,
-        x.taraf === 'ust' ? 'UST' : 'ALT', x.sov, x.oran, x.mbc ?? '', b.toplam ?? '', x.sonuc ?? '', x.net ?? '', x.yakin ? 'evet' : '', b.sonucKaynak, b.kaynak,
-        b.referans, b.refGecen || '', b.refAlt ?? b.preAlt ?? '', b.refUst ?? b.preUst ?? '']
-        .map(v => String(v).replace(/;/g, ',')).join(';'));
+  // ---------- Excel (.xlsx) dışa aktarım ----------
+  // Kütüphane yok: sayfalar XML olarak yazılır, sıkıştırmasız zip'e konur. Excel, LibreOffice, Numbers ve Google E-Tablolar açar.
+  const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let i = 0; i < 8; i++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  const crc32 = (b) => { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+  function zipla(dosyalar) {                           // { ad: metin } → Uint8Array
+    const enc = new TextEncoder(), yerel = [], merkez = [];
+    let ofs = 0;
+    for (const [adMetin, metin] of Object.entries(dosyalar)) {
+      const ad = enc.encode(adMetin), veri = enc.encode(metin), crc = crc32(veri);
+      const l = new DataView(new ArrayBuffer(30)), m = new DataView(new ArrayBuffer(46));
+      l.setUint32(0, 0x04034b50, true); l.setUint16(4, 20, true); l.setUint16(6, 0x0800, true); l.setUint16(12, 33, true);
+      l.setUint32(14, crc, true); l.setUint32(18, veri.length, true); l.setUint32(22, veri.length, true); l.setUint16(26, ad.length, true);
+      m.setUint32(0, 0x02014b50, true); m.setUint16(4, 20, true); m.setUint16(6, 20, true); m.setUint16(8, 0x0800, true); m.setUint16(14, 33, true);
+      m.setUint32(16, crc, true); m.setUint32(20, veri.length, true); m.setUint32(24, veri.length, true); m.setUint16(28, ad.length, true); m.setUint32(42, ofs, true);
+      yerel.push(new Uint8Array(l.buffer), ad, veri); merkez.push(new Uint8Array(m.buffer), ad);
+      ofs += 30 + ad.length + veri.length;
     }
-    return '\uFEFF' + sat.join('\n');
+    const mBoy = merkez.reduce((a, x) => a + x.length, 0), son = new DataView(new ArrayBuffer(22));
+    const n = Object.keys(dosyalar).length;
+    son.setUint32(0, 0x06054b50, true); son.setUint16(8, n, true); son.setUint16(10, n, true); son.setUint32(12, mBoy, true); son.setUint32(16, ofs, true);
+    const hepsi = [...yerel, ...merkez, new Uint8Array(son.buffer)], out = new Uint8Array(ofs + mBoy + 22);
+    let i = 0; for (const x of hepsi) { out.set(x, i); i += x.length; }
+    return out;
   }
+  // sayfalar: [{ ad, sutunlar: [{ b: başlık, g: genişlik, tur: 'tarih' | 'ondalik' }], satirlar: [[…]], filtre }]
+  function xlsx(sayfalar) {
+    const kac = (v) => String(v).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const harf = (i) => { let s = ''; for (i++; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s; return s; };
+    const NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"', BAS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+    const hucre = (v, ref, s) => v == null || v === '' ? ''
+      : typeof v === 'number' && isFinite(v) ? `<c r="${ref}"${s ? ` s="${s}"` : ''}><v>${v}</v></c>`
+      : `<c r="${ref}" t="inlineStr"${s ? ` s="${s}"` : ''}><is><t xml:space="preserve">${kac(v)}</t></is></c>`;
+    const stil = { tarih: 2, ondalik: 3 };
+    const dosyalar = {
+      '[Content_Types].xml': `${BAS}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+        sayfalar.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('') + '</Types>',
+      '_rels/.rels': `${BAS}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
+      'xl/workbook.xml': `${BAS}<workbook ${NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>` +
+        sayfalar.map((s, i) => `<sheet name="${kac(s.ad)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('') + '</sheets>' +
+        ((ad) => (ad ? `<definedNames>${ad}</definedNames>` : ''))(sayfalar.map((s, i) => s.filtre && s.satirlar.length
+          ? `<definedName name="_xlnm._FilterDatabase" localSheetId="${i}" hidden="1">'${kac(s.ad)}'!$A$1:$${harf(s.sutunlar.length - 1)}$${s.satirlar.length + 1}</definedName>` : '').join('')) +
+        '</workbook>',
+      'xl/_rels/workbook.xml.rels': `${BAS}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        sayfalar.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('') +
+        `<Relationship Id="rId${sayfalar.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
+      'xl/styles.xml': `${BAS}<styleSheet ${NS}><numFmts count="2"><numFmt numFmtId="164" formatCode="dd.mm.yyyy hh:mm"/><numFmt numFmtId="165" formatCode="0.0#"/></numFmts>` +
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>' +
+        '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF2F2F2"/></patternFill></fill></fills>' +
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+        '<cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>' +
+        '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>' +
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>',
+    };
+    sayfalar.forEach((s, i) => {
+      const satir = (dizi, r, baslik) => `<row r="${r}">${dizi.map((v, c) => hucre(v, harf(c) + r, baslik ? 1 : stil[(s.sutunlar[c] || {}).tur] || 0)).join('')}</row>`;
+      dosyalar[`xl/worksheets/sheet${i + 1}.xml`] = `${BAS}<worksheet ${NS}>` +
+        '<sheetViews><sheetView workbookViewId="0"' + (i === 0 ? ' tabSelected="1"' : '') + '><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>' +
+        `<cols>${s.sutunlar.map((k, j) => `<col min="${j + 1}" max="${j + 1}" width="${k.g || 11}" customWidth="1"/>`).join('')}</cols>` +
+        `<sheetData>${satir(s.sutunlar.map(k => k.b), 1, true)}${s.satirlar.map((d, j) => satir(d, j + 2)).join('')}</sheetData>` +
+        (s.filtre && s.satirlar.length ? `<autoFilter ref="A1:${harf(s.sutunlar.length - 1)}${s.satirlar.length + 1}"/>` : '') + '</worksheet>';
+    });
+    return zipla(dosyalar);
+  }
+  const excelTarih = (ms) => +((ms - new Date(ms).getTimezoneOffset() * 60000) / 86400000 + 25569).toFixed(6);
+  const sayi = (v) => (v == null || v === '' || isNaN(+v) ? '' : +v);
+
+  // Excel: Özet + her kupon varyasyonu (referans) ayrı sayfa. Sütunlar her sayfada aynı sırada.
+  function sanalExcel() {
+    const liste = sanalListe();
+    const ozetSutun = [{ b: 'Referans', g: 14 }, { b: 'Eşik', g: 7 }, { b: 'Bahis', g: 8 }, { b: 'Biten', g: 8 }, { b: 'Kazanç', g: 8 }, { b: 'Kayıp', g: 8 },
+      { b: 'Kazanma %', g: 11, tur: 'ondalik' }, { b: 'Başabaş %', g: 11, tur: 'ondalik' }, { b: 'Ort. oran', g: 10, tur: 'ondalik' }, { b: 'Net TL', g: 10 }, { b: 'ROI %', g: 9, tur: 'ondalik' }];
+    const r1 = (x) => (x == null ? '' : +x.toFixed(1)), r2 = (x) => (x == null ? '' : +x.toFixed(2));
+    const ozetSatir = sanalOzet(liste).map(r => [REF_AD[r.referans] || r.referans, r.esik, r.toplam, r.biten, r.kaz, r.kay,
+      r1(r.yuzde), r1(r.basabas), r2(r.ortOran), r.biten ? Math.round(r.net) : '', r1(r.roi)]);
+    ozetSatir.push([], [`Oluşturuldu: ${new Date().toLocaleString('tr-TR')} · v${VERSIYON} · her bahis ${AYAR.SANAL_TUTAR} TL`],
+      ['Aynı maçın farklı referanslardaki bahisleri birbirine bağlıdır (aynı maç sonucu). Maç ID sütunuyla sayfalar arasında eşleştirilebilir.']);
+    const sutun = [{ b: 'Zaman', g: 16, tur: 'tarih' }, { b: 'Maç ID', g: 10 }, { b: 'Maç', g: 34 }, { b: 'Lig', g: 24 }, { b: 'Eşik', g: 6 },
+      { b: 'Barem yönü', g: 11 }, { b: 'Maç dk', g: 8 }, { b: 'Geçen süre', g: 10 }, { b: 'Çeyrek', g: 7 }, { b: 'Çeyrekte kalan', g: 9 }, { b: 'Skor (anında)', g: 12 },
+      { b: 'Maç öncesi ana', g: 10 }, { b: 'Maç öncesi en alt', g: 10 }, { b: 'Maç öncesi en üst', g: 10 },
+      { b: 'Referans anı', g: 10 }, { b: 'Referans en alt', g: 10 }, { b: 'Referans en üst', g: 10 }, { b: 'Karşılaştırılan', g: 11 }, { b: 'Fark', g: 7 },
+      { b: 'Taraf', g: 7 }, { b: 'Barem', g: 8 }, { b: 'Oran', g: 7, tur: 'ondalik' }, { b: 'MBS', g: 6 }, { b: 'Toplam sayı', g: 9 }, { b: 'Sonuç', g: 7 },
+      { b: 'Net TL', g: 9 }, { b: 'Kontrol et', g: 9 }, { b: 'Sonuç kaynağı', g: 16 }, { b: 'Veri kaynağı', g: 11 }];
+    const bahisSatir = (b) => {
+      const x = b.ters, pre = b.referans === 'pre';
+      return [excelTarih(b.t), sayi(b.id), b.mac, b.lig || '', sayi(b.esik), b.yon === 'ust' ? 'YUKARI' : 'AŞAĞI', sayi(b.dk), b.gecen || '', sayi(b.ceyrek), b.ceyrekKalan || b.kalan || '', b.skor || '',
+        sayi(b.pre), sayi(b.preAlt), sayi(b.preUst),
+        pre ? 'maç öncesi' : b.refGecen || '', sayi(pre ? b.preAlt : b.refAlt), sayi(pre ? b.preUst : b.refUst), sayi(b.preRef), sayi(b.fark),
+        x.taraf === 'ust' ? 'ÜST' : 'ALT', sayi(x.sov), sayi(x.oran), sayi(x.mbc), sayi(b.toplam), x.sonuc || '', sayi(x.net), x.yakin ? 'evet' : '', b.sonucKaynak || '', b.kaynak || ''];
+    };
+    const refler = [...new Set([...AYAR.REFERANSLAR, ...liste.map(b => b.referans)])];
+    return xlsx([{ ad: 'Özet', sutunlar: ozetSutun, satirlar: ozetSatir },
+      ...refler.map(r => ({ ad: REF_AD[r] || r, sutunlar: sutun, filtre: true, satirlar: liste.filter(b => b.referans === r).sort((a, b) => a.t - b.t).map(bahisSatir) }))]);
+  }
+  const XLSX_TUR = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
   // ---------- panel ----------
   const SEKMELER = [['canli', 'Canlı'], ['yaklasan', 'Yaklaşan'], ['biten', 'Biten'], ['uyari', 'Uyarılar'], ['sanal', 'Sanal kupon']];
@@ -682,15 +763,15 @@
     };
     baslik = el('span', 'flex:1', '');
     bas.append(baslik,
-      btn('CSV', () => indir(sanalCSV(), 'text/csv;charset=utf-8', `iddaa13-sanal-kupon-${yerelTarih()}.csv`)),
+      btn('Excel', () => indir(sanalExcel(), XLSX_TUR, `iddaa13-sanal-kupon-${yerelTarih()}.xlsx`)),
       btn('Geçmişi temizle', () => {
         const biten = Object.values(db.mac).filter(k => k.bitti);
         const bahis = biten.reduce((a, k) => a + Object.keys(k.sanal || {}).length, 0);
         if (!window.confirm('Geçmiş silinsin mi? Emin misiniz?\n\n' +
           `Silinecek: ${biten.length} biten maç, bu maçlardaki ${bahis} sanal bahis ve ${(db.uyarilar || []).length} uyarı kaydı.\n` +
           'Canlı ve yaklaşan maçlar, maç öncesi baremler ve ayarlar korunur.\n\n' +
-          'Silmeden önce bütün sanal bahisler otomatik olarak CSV dosyasına yedeklenir.')) return;
-        if (bahis) indir(sanalCSV(), 'text/csv;charset=utf-8', `iddaa13-yedek-${yerelTarih()}.csv`);
+          'Silmeden önce bütün sanal bahisler otomatik olarak Excel dosyasına yedeklenir.')) return;
+        if (bahis) indir(sanalExcel(), XLSX_TUR, `iddaa13-yedek-${yerelTarih()}.xlsx`);
         for (const id in db.mac) if (db.mac[id].bitti) delete db.mac[id];
         db.uyarilar = [];
         kaydet(); cizIste();
@@ -838,38 +919,87 @@
     cizIste();
   }
 
+  // Sanal kupon sekmesi: alt sekmeler — Karşılaştırma + her kupon varyasyonu (referans) ayrı
+  let kuponSekme = lsOku('iddaa13_kupon_sekme') || 'karsilastirma';
+  const REF_TABAN = { pre: 'maç öncesi son', dk5: '5:00 oynandığındaki canlı', c1: '1. çeyrek bittiğindeki canlı' };
+
   function cizSanal(list) {
     const yz = (x, n = 1) => (x == null ? '-' : x.toFixed(n));
     const tl = (x) => `${x > 0 ? '+' : ''}${Math.round(x).toLocaleString('tr-TR')} TL`;
     const renk = (x) => (x > 0 ? YESIL : x < 0 ? KIRMIZI : '');
-    govde.append(el('div', 'color:#9ca3af;margin-bottom:4px;',
-      `Her bahis ${AYAR.SANAL_TUTAR.toLocaleString('tr-TR')} TL. Ters: barem yukarı kaçınca en üst baremde ALT, aşağı kaçınca en alt baremde ÜST. ` +
-      `Fark üç referansa göre ayrı ölçülür (maç öncesi, 5. dk, 1. çeyrek sonu); Telegram sadece ${AYAR.UYARI_REFERANSLAR.map(r => REF_AD[r].toLowerCase()).join(', ')} için gider.`));
-    tablo(['Referans', 'Eşik', 'Bahis', 'Biten', 'K-Y', 'Kazanma', 'Başabaş', 'Ort. oran', 'Net', 'ROI'], sanalOzet(list).map(r => ({
-      h: [REF_AD[r.referans] || r.referans, `±${r.esik}`, r.toplam, r.biten, `${r.kaz}-${r.kay}`, r.yuzde == null ? '-' : `${yz(r.yuzde)}%`,
+    const aciklama = (txt) => govde.append(el('div', 'color:#9ca3af;margin-bottom:4px;', txt));
+    const refler = [...new Set([...AYAR.REFERANSLAR, ...list.map(b => b.referans)])];
+    const altSekmeler = [['karsilastirma', 'Karşılaştırma', list.length], ...refler.map(r => [r, REF_AD[r] || r, list.filter(b => b.referans === r).length])];
+    if (!altSekmeler.some(([k]) => k === kuponSekme)) kuponSekme = 'karsilastirma';
+    const satir = el('div', 'display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;');
+    for (const [key, ad, n] of altSekmeler) {
+      const b = el('button', 'font:11px system-ui;padding:2px 9px;border:1px solid #374151;border-radius:12px;cursor:pointer;' +
+        (kuponSekme === key ? 'background:#f9fafb;color:#111827;font-weight:600;' : 'background:transparent;color:#d1d5db;'), `${ad} (${n})`);
+      b.onclick = () => { kuponSekme = key; try { localStorage.setItem('iddaa13_kupon_sekme', key); } catch (e) { /* */ } cizIste(); };
+      satir.append(b);
+    }
+    govde.append(satir);
+
+    const ozetTablo = (satirlar, refSutun) => tablo([...(refSutun ? ['Referans'] : []), 'Eşik', 'Bahis', 'Biten', 'K-Y', 'Kazanma', 'Başabaş', 'Ort. oran', 'Net', 'ROI'], satirlar.map(r => ({
+      h: [...(refSutun ? [REF_AD[r.referans] || r.referans] : []), `±${r.esik}`, r.toplam, r.biten, `${r.kaz}-${r.kay}`, r.yuzde == null ? '-' : `${yz(r.yuzde)}%`,
         r.basabas == null ? '-' : `${yz(r.basabas)}%`, yz(r.ortOran, 2),
         { t: r.biten ? tl(r.net) : '-', css: renk(r.net) }, { t: r.roi == null ? '-' : `${yz(r.roi)}%`, css: renk(r.roi || 0) }],
     })));
-    if (!list.length) return bos(`Henüz sanal bahis yok. ±${AYAR.FARK} geçildiğinde burada birikecek.`);
+    const sonucHucre = (b, yakin) => (b.toplam != null
+      ? { t: `${b.toplam}${yakin ? ' ⚠' : ''}`, tik: () => sonucGir(b.id) }
+      : b.bitti ? { t: 'sonuç gir', css: 'color:#fbbf24;', tik: () => sonucGir(b.id) } : 'oynanıyor');
+    const isaret = (x) => (x.sonuc ? (x.sonuc === 'K' ? ' ✓' : ' ✗') : '');
+    const bahisYazi = (x) => `${x.taraf === 'ust' ? 'ÜST' : 'ALT'} ${x.sov}${isaret(x)}`;
+    const sonucRenk = (xs) => (xs.every(x => x.sonuc === 'K') ? 'color:#34d399;' : xs.every(x => x.sonuc === 'Y') ? 'color:#f87171;' : '');
+    const sonIpucu = 'Sonuç Sportradar\'dan otomatik gelir. Gelmezse "sonuç gir"e, düzeltmek için toplam sayıya tıklayın. ⚠ = son görülen skorla sonuçlandı ve bareme 3 sayıdan yakın; kontrol edin.';
+
+    // ----- Karşılaştırma: referansların özeti + maç bazında yan yana -----
+    if (kuponSekme === 'karsilastirma') {
+      aciklama(`Aynı kural, ${refler.length} farklı referans: fark ${refler.map(r => REF_AD[r].toLowerCase()).join(', ')} uç baremlerine göre ayrı ölçülür ve her biri kendi kuponunu açar. ` +
+        `Her bahis ${AYAR.SANAL_TUTAR.toLocaleString('tr-TR')} TL, Ters. Telegram sadece ${AYAR.UYARI_REFERANSLAR.map(r => REF_AD[r].toLowerCase()).join(', ')} referansı için gider.`);
+      ozetTablo(sanalOzet(list), true);
+      if (!list.length) return bos(`Henüz sanal bahis yok. ±${AYAR.FARK} geçildiğinde burada birikecek.`);
+      const maclar = new Map();                                  // liste yeniden eskiye sıralı → en son bahisli maç üstte
+      for (const b of list) {
+        if (!maclar.has(b.id)) maclar.set(b.id, { id: b.id, mac: b.mac, t: b.t, bitti: b.bitti, toplam: b.toplam, bahis: {} });
+        const m = maclar.get(b.id);
+        (m.bahis[b.referans] || (m.bahis[b.referans] = [])).push(b);
+      }
+      govde.append(el('div', 'color:#9ca3af;margin:10px 0 2px;', 'Maç bazında — aynı maçın bahisleri yan yana:'));
+      tablo(['Son bahis', 'Maç', ...refler.map(r => REF_AD[r] || r), 'Toplam'], [...maclar.values()].map(m => ({
+        h: [`${gun(m.t)} ${saat(m.t)}`, { t: m.mac, wrap: true },
+          ...refler.map(r => {
+            const xs = (m.bahis[r] || []).map(b => b.ters);
+            return xs.length ? { t: xs.map(bahisYazi).join(' · '), css: sonucRenk(xs), wrap: xs.length > 1 } : { t: '–', css: 'color:#4b5563;' };
+          }),
+          sonucHucre(m, Object.values(m.bahis).flat().some(b => b.ters.yakin))],
+      })));
+      return ipucu('"–" = o referans bu maçta eşiği geçmedi. Aynı maçın bahisleri aynı sonuca bağlıdır; bağımsız test gibi değerlendirmeyin. ' +
+        'Ayrıntı için üstteki varyasyon sekmesine geçin. ' + sonIpucu);
+    }
+
+    // ----- Tek varyasyon: kendi özeti + bahis listesi -----
+    const r = kuponSekme, lr = list.filter(b => b.referans === r);
+    aciklama(`${REF_AD[r] || r} kuponu: fark, ${REF_TABAN[r] || ''} en alt / en üst baremlere göre ölçülür. ` +
+      (AYAR.UYARI_REFERANSLAR.includes(r) ? 'Eşik geçilince Telegram uyarısı da gider.' : 'Telegram\'a gitmez, sadece buraya yazılır.') +
+      ` Her bahis ${AYAR.SANAL_TUTAR.toLocaleString('tr-TR')} TL. Ters: barem yukarı kaçınca en üst baremde ALT, aşağı kaçınca en alt baremde ÜST.`);
+    ozetTablo(sanalOzet(lr).filter(o => o.referans === r), false);
+    if (!lr.length) return bos(`Bu varyasyonda henüz bahis yok. ${REF_AD[r] || r} referansına göre ±${AYAR.FARK} geçildiğinde burada birikecek.`);
     govde.append(el('div', 'height:10px'));
-    tablo(['Zaman', 'Maç', 'Ref', 'Eşik', 'Dk', 'Hareket', 'Bahis', 'Toplam'], list.map(b => {
+    tablo(['Zaman', 'Maç', 'Eşik', 'Dk', 'Hareket', 'Bahis', 'Toplam'], lr.map(b => {
       const x = b.ters, key = `s${b.id}_${b.referans}_${b.esik}_${b.yon}`;
-      const sonucHucre = b.toplam != null
-        ? { t: `${b.toplam}${x.yakin ? ' ⚠' : ''}`, tik: () => sonucGir(b.id) }
-        : b.bitti ? { t: 'sonuç gir', css: 'color:#fbbf24;', tik: () => sonucGir(b.id) } : 'oynanıyor';
       return {
-        h: [`${gun(b.t)} ${saat(b.t)}`, { t: b.mac, wrap: true }, REF_AD[b.referans] || b.referans, `±${b.esik}`, b.dk ? `${b.dk}'` : '-',
+        h: [`${gun(b.t)} ${saat(b.t)}`, { t: b.mac, wrap: true }, `±${b.esik}`, b.dk ? `${b.dk}'` : '-',
           `${b.preRef ?? b.pre} ${b.yon === 'ust' ? '↑ +' : '↓ -'}${b.fark}`,
-          { t: `${x.taraf === 'ust' ? 'ÜST' : 'ALT'} ${x.sov} @${oranYazi(x.oran)}${x.sonuc ? (x.sonuc === 'K' ? ' ✓' : ' ✗') : ''}`,
-            css: x.sonuc === 'K' ? 'color:#34d399;' : x.sonuc === 'Y' ? 'color:#f87171;' : '' },
-          sonucHucre],
+          { t: `${x.taraf === 'ust' ? 'ÜST' : 'ALT'} ${x.sov} @${oranYazi(x.oran)}${isaret(x)}`, css: sonucRenk([x]) },
+          sonucHucre(b, x.yakin)],
         tik: ac(key),
         ek: acik[key] ? `${b.lig || ''}\nReferans: ${REF_AD[b.referans] || b.referans}${b.refGecen ? ` (${b.refGecen})` : ''} en alt–en üst ${b.refAlt ?? b.preAlt ?? '-'}–${b.refUst ?? b.preUst ?? '-'}` +
           ` · maç öncesi ${b.preAlt ?? '-'}–${b.preUst ?? '-'}\nEşik anı: ${b.dkYazi || '-'} · skor ${b.skor || '-'} · ${b.kaynak}\nSonuç kaynağı: ${b.sonucKaynak || '-'}\n` +
           `Açık baremler:\n${(b.baremler || []).map(y => `  ${y.sov}  Alt ${oranYazi(y.alt)} / Üst ${oranYazi(y.ust)}  MBS ${y.mbc ?? '-'}`).join('\n')}` : null,
       };
     }));
-    ipucu('Sonuç Sportradar\'dan otomatik gelir. Gelmezse "sonuç gir"e, düzeltmek için toplam sayıya tıklayın. ⚠ = son görülen skorla sonuçlandı ve bareme 3 sayıdan yakın; kontrol edin.');
+    ipucu(sonIpucu);
   }
 
   let cizBekliyor = false;
@@ -913,7 +1043,7 @@
   }
 
   // ---------- başlat ----------
-  window.iddaa13 = { db: () => db, durum, AYAR, sanalListe, sanalOzet, sanalCSV, oyunZamani, refDeger }; // konsoldan inceleme için
+  window.iddaa13 = { db: () => db, durum, AYAR, sanalListe, sanalOzet, sanalExcel, oyunZamani, refDeger }; // konsoldan inceleme için
   bakim();
   kaydet();
   panelKur();
