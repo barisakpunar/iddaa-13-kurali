@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         iddaa 13 Kuralı - Canlı Basketbol Barem Uyarısı
 // @namespace    iddaa-13-kurali
-// @version      3.3
-// @description  Canlı basketbol "Toplam Sayı Alt/Üst": canlı uç barem, maç öncesi uç baremden FARK kadar sapınca Telegram uyarısı + sanal kupon (Ters).
+// @version      3.4
+// @description  Canlı basketbol "Toplam Sayı Alt/Üst": canlı uç barem, referans uç baremden (maç öncesi / 5. dk / 1. çeyrek sonu) FARK kadar sapınca sanal kupon (Ters) + maç öncesi için Telegram uyarısı.
 // @match        https://www.iddaa.com/*
 // @grant        none
 // @run-at       document-idle
@@ -20,6 +20,11 @@
     FARK: 15,                  // canlı uç barem, maç öncesi uç baremden bu kadar saparsa uyarı + sanal bahis
                                // (paneldeki "Fark eşiği" kutusundan girilen değer bunun yerine geçer)
     SANAL_TUTAR: 1000,         // her sanal bahis (TL)
+    // ---- referanslar: fark bu noktalardaki uç baremlere göre AYRI AYRI ölçülür, her biri kendi sanal kuponunu açar ----
+    //   pre = maç öncesi son görüntü · dk5 = 5:00 oynandığında canlı · c1 = 1. çeyrek bittiğinde canlı
+    REFERANSLAR: ['pre', 'dk5', 'c1'],
+    UYARI_REFERANSLAR: ['pre'],  // Telegram'a sadece bunlar gider; diğerleri sessizce sanal kupona yazılır
+    REF_TOLERANS_SN: 180,        // dk5 / c1 anı bu kadar oyun saniyesi geçtikten sonra görülürse (script geç açıldı vb.) o maçta atlanır
     CANLI_KONTROL_SN: 15,      // canlı liste kontrolü (WebSocket'e ek, yedek)
     MAC_ONCESI_KONTROL_SN: 60, // maç öncesi baremlerin kaydı
     PRE_DETAY_DK: 30,          // başlamaya bu kadar dk kala bütün maç öncesi baremleri (en alt / en üst) her taramada çek
@@ -37,7 +42,7 @@
   if (window.top !== window || window.__iddaa13) return;
   window.__iddaa13 = true;
 
-  const VERSIYON = '3.3';
+  const VERSIYON = '3.4';
   const API = 'https://sportsbookv2.iddaa.com/sportsbook';
   const SR = 'https://stats.fn.sportradar.com/sansgirisimnew/tr/Europe:Istanbul/gismo'; // iddaa'nın kullandığı Sportradar verisi
   const WS_ORAN = 'wss://sportsbooksocket.iddaa.com/sportsBookHubLite';  // currentOdds / currentEvents
@@ -48,6 +53,7 @@
   const LIVE = { t: 4, st: 140 };    // Toplam Sayı Alt/Üst (Uzt.Dahil) - canlı
   const KEY = 'iddaa13_v1';
   const FARK_KEY = 'iddaa13_fark';
+  const REF_AD = { pre: 'Maç öncesi', dk5: '5. dk', c1: '1. çeyrek' };
   const log = (...a) => console.log('%c[13 Kuralı]', 'color:#e67e22;font-weight:bold', ...a);
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const VARSAYILAN_FARK = AYAR.FARK;
@@ -293,7 +299,33 @@
     const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
     const ad = ceyrek > n ? `${ceyrek - n}. uzatma` : `${ceyrek}. ${n === 2 ? 'devre' : 'çeyrek'}`;
     const yas = Math.round((Date.now() - t) / 1000);
-    return { dk, ceyrek, kalan: mmss(kalan), gecen: mmss(gecen), yazi: `${dk}' (${ad}, ${mmss(kalan)} kala${yas > 20 ? `, ${yas} sn önceki saat` : ''})` };
+    return { dk, ceyrek, kalan: mmss(kalan), gecen: mmss(gecen), gecenSn: gecen, perSn: per, n, yazi: `${dk}' (${ad}, ${mmss(kalan)} kala${yas > 20 ? `, ${yas} sn önceki saat` : ''})` };
+  }
+
+  // ---------- referanslar ----------
+  // Referansın en alt / en üst baremi → { alt, ust } ya da null (henüz yok / kaçırıldı)
+  function refDeger(k, r) {
+    if (r === 'pre') return k.pre == null ? null : { alt: k.preAlt ?? k.pre, ust: k.preUst ?? k.pre };
+    const x = k.ref && k.ref[r];
+    return x && !x.kacti ? x : null;
+  }
+  // Canlı referanslar: oyun süresi hedefe ilk ulaştığında o anki canlı en alt / en üst barem sabitlenir.
+  //   dk5 = 5:00 oynandı · c1 = 1. çeyrek bitti (devre usulü liglerde 1. devrenin yarısı)
+  // Sadece detay objesinden (bütün baremler) yakalanır; liste objesiyle hedefe gelinmişse detay istenir.
+  // Saat bilinmiyorsa yakalanmaz. Hedef REF_TOLERANS_SN'den geç görülürse "kacti" işaretlenir ve o maçta o referans atlanır.
+  function refYakala(id, k, enAlt, enUst, detay, kaynak) {
+    const oz = oyunZamani(k);
+    if (!oz) return;
+    const ref = k.ref || (k.ref = {});
+    const hedef = { dk5: 300, c1: oz.n === 2 ? oz.perSn / 2 : oz.perSn };
+    for (const r of AYAR.REFERANSLAR) {
+      if (!(r in hedef) || ref[r] || oz.gecenSn < hedef[r]) continue;
+      const gec = oz.gecenSn - hedef[r] > AYAR.REF_TOLERANS_SN;
+      if (!gec && !detay) { detayCek(id, kaynak); continue; }
+      ref[r] = gec ? { kacti: true, t: Date.now(), dk: oz.dk, gecen: oz.gecen }
+        : { alt: enAlt.sov, ust: enUst.sov, t: Date.now(), dk: oz.dk, gecen: oz.gecen };
+      kaydet();
+    }
   }
 
   // ---------- çekirdek: maç objesini (liste veya detay) değerlendir ----------
@@ -329,60 +361,69 @@
     k.aralik = [enAlt.sov, enUst.sov];
     gecmisEkle(k, 'canliGecmis', `${enAlt.sov}–${enUst.sov}`);
     durum.sonVeri = Date.now();
-    if (k.pre == null) { kaydetIste(); return; }
+    refYakala(e.i, k, enAlt, enUst, detay, kaynak);
 
-    // canlı EN ÜST − maç öncesi EN ÜST (yukarı) / canlı EN ALT − maç öncesi EN ALT (aşağı)
-    const refUst = k.preUst != null ? k.preUst : k.pre;
-    const refAlt = k.preAlt != null ? k.preAlt : k.pre;
-    k.farkUst = +(enUst.sov - refUst).toFixed(1);
-    k.farkAlt = +(enAlt.sov - refAlt).toFixed(1);
-    k.maxUst = Math.max(k.maxUst ?? -Infinity, k.farkUst);
-    k.minAlt = Math.min(k.minAlt ?? Infinity, k.farkAlt);
-
+    // Her referans için: canlı EN ÜST − referans EN ÜST (yukarı) / canlı EN ALT − referans EN ALT (aşağı)
     const ue = k.uyariE || (k.uyariE = {});
     const sk = k.sanal || (k.sanal = {});
-    for (const yon of ['ust', 'alt']) {
-      const sapma = yon === 'ust' ? k.farkUst : -k.farkAlt;     // ilgili yöndeki sapma (pozitif)
-      if (!(sapma >= AYAR.FARK)) continue;
-      const anahtar = `${AYAR.FARK}_${yon}`;
-      if (ue[anahtar] && sk[anahtar]) continue;
-      const b = yon === 'ust' ? enUst : enAlt;
-      const ref = yon === 'ust' ? refUst : refAlt;
-      const oz = oyunZamani(k);
-      // Ters bahis: barem yukarı kaçtı → en üst baremde ALT; aşağı kaçtı → en alt baremde ÜST
-      const bahis = yon === 'ust'
-        ? { taraf: 'alt', sov: enUst.sov, oran: enUst.alt, mbc: enUst.mbc }
-        : { taraf: 'ust', sov: enAlt.sov, oran: enAlt.ust, mbc: enAlt.mbc };
+    const rf = k.refFark || (k.refFark = {});
+    for (const r of AYAR.REFERANSLAR) {
+      const ref = refDeger(k, r);
+      if (!ref) continue;                                        // referans henüz yok
+      const eski = rf[r] || (r === 'pre' ? { maxUst: k.maxUst, minAlt: k.minAlt } : {});
+      const f = { ust: +(enUst.sov - ref.ust).toFixed(1), alt: +(enAlt.sov - ref.alt).toFixed(1) };
+      f.maxUst = Math.max(eski.maxUst ?? -Infinity, f.ust);
+      f.minAlt = Math.min(eski.minAlt ?? Infinity, f.alt);
+      rf[r] = f;
+      if (r === 'pre') { k.farkUst = f.ust; k.farkAlt = f.alt; k.maxUst = f.maxUst; k.minAlt = f.minAlt; } // panel bunları okur
+      const uyariAcik = AYAR.UYARI_REFERANSLAR.includes(r);
 
-      if (!sk[anahtar]) {
-        sk[anahtar] = {
-          t: Date.now(), esik: AYAR.FARK, yon, pre: k.pre, preAlt: refAlt, preUst: refUst, preRef: ref, fark: sapma,
-          skor: k.skor || '', lig: k.lig || '', kaynak, baremler: list,
-          dk: oz ? oz.dk : null, dkYazi: oz ? oz.yazi : '', gecen: oz ? oz.gecen : '', ceyrek: oz ? oz.ceyrek : null, ceyrekKalan: oz ? oz.kalan : '',
-          ters: bahis,
-        };
+      for (const yon of ['ust', 'alt']) {
+        const sapma = yon === 'ust' ? f.ust : -f.alt;           // ilgili yöndeki sapma (pozitif)
+        if (!(sapma >= AYAR.FARK)) continue;
+        const anahtar = r === 'pre' ? `${AYAR.FARK}_${yon}` : `${r}_${AYAR.FARK}_${yon}`; // pre: eski anahtar biçimi korunur
+        if (sk[anahtar] && (ue[anahtar] || !uyariAcik)) continue;
+        const b = yon === 'ust' ? enUst : enAlt;
+        const karsi = yon === 'ust' ? ref.ust : ref.alt;         // karşılaştırılan referans barem
+        const oz = oyunZamani(k);
+        // Ters bahis: barem yukarı kaçtı → en üst baremde ALT; aşağı kaçtı → en alt baremde ÜST
+        const bahis = yon === 'ust'
+          ? { taraf: 'alt', sov: enUst.sov, oran: enUst.alt, mbc: enUst.mbc }
+          : { taraf: 'ust', sov: enAlt.sov, oran: enAlt.ust, mbc: enAlt.mbc };
+
+        if (!sk[anahtar]) {
+          sk[anahtar] = {
+            t: Date.now(), referans: r, refAlt: ref.alt, refUst: ref.ust, refGecen: r === 'pre' ? '' : ref.gecen,
+            esik: AYAR.FARK, yon, pre: k.pre, preAlt: k.preAlt ?? k.pre, preUst: k.preUst ?? k.pre, preRef: karsi, fark: sapma,
+            skor: k.skor || '', lig: k.lig || '', kaynak, baremler: list,
+            dk: oz ? oz.dk : null, dkYazi: oz ? oz.yazi : '', gecen: oz ? oz.gecen : '', ceyrek: oz ? oz.ceyrek : null, ceyrekKalan: oz ? oz.kalan : '',
+            ters: bahis,
+          };
+        }
+        if (uyariAcik && !ue[anahtar]) {
+          ue[anahtar] = { t: Date.now() };
+          const link = macLinki(e.i);
+          const enAd = yon === 'ust' ? 'üst' : 'alt';
+          const refAd = r === 'pre' ? 'maç öncesi' : `${REF_AD[r]} (${ref.gecen})`;
+          const msg =
+            `13 KURALI · ±${AYAR.FARK} (${yon === 'ust' ? 'barem YUKARI' : 'barem AŞAĞI'})${r === 'pre' ? '' : ` · referans ${REF_AD[r]}`}\n` +
+            `${k.hn} - ${k.an}${k.lig ? `\n${k.lig}` : ''}\n` +
+            `Maç dakikası: ${oz ? oz.yazi : 'bilinmiyor'}\n` +
+            (r === 'pre' ? `Maç öncesi baremler: ${ref.alt}–${ref.ust} (ana ${k.pre})\n` : `${REF_AD[r]} baremleri (${ref.gecen} oynandığında): ${ref.alt}–${ref.ust}\n`) +
+            `Canlı en ${enAd} barem: ${b.sov} → ${refAd} en ${enAd} ${karsi}'e göre ${isaretli(+(b.sov - karsi).toFixed(1))}\n` +
+            `>> TERS BAHİS: ${bahis.taraf === 'ust' ? 'ÜST' : 'ALT'} ${bahis.sov} @${oranYazi(bahis.oran)}${bahis.mbc > 1 ? ` (MBS ${bahis.mbc}, tek oynanmaz!)` : ''}\n` +
+            `Açık canlı baremler:\n${list.map(x => `  ${x.sov}  Alt ${oranYazi(x.alt)} / Üst ${oranYazi(x.ust)}`).join('\n')}\n` +
+            (k.skor ? `Skor: ${k.skor}\n` : '') +
+            `Kaynak: ${kaynak}\n` + link;
+          log(msg);
+          telegram(msg, link);
+          (db.uyarilar || (db.uyarilar = [])).unshift({
+            t: Date.now(), id: e.i, mac: `${k.hn} - ${k.an}`, referans: r, esik: AYAR.FARK, yon, preRef: karsi, canli: b.sov,
+            fark: +(b.sov - karsi).toFixed(1), skor: k.skor || '', dk: oz ? oz.dk : null, kaynak,
+          });
+        }
+        kaydet();
       }
-      if (!ue[anahtar]) {
-        ue[anahtar] = { t: Date.now() };
-        const link = macLinki(e.i);
-        const msg =
-          `13 KURALI · ±${AYAR.FARK} (${yon === 'ust' ? 'barem YUKARI' : 'barem AŞAĞI'})\n` +
-          `${k.hn} - ${k.an}${k.lig ? `\n${k.lig}` : ''}\n` +
-          `Maç dakikası: ${oz ? oz.yazi : 'bilinmiyor'}\n` +
-          `Maç öncesi baremler: ${refAlt}–${refUst} (ana ${k.pre})\n` +
-          `Canlı en ${yon === 'ust' ? 'üst' : 'alt'} barem: ${b.sov} → maç öncesi en ${yon === 'ust' ? 'üst' : 'alt'} ${ref}'e göre ${isaretli(+(b.sov - ref).toFixed(1))}\n` +
-          `>> TERS BAHİS: ${bahis.taraf === 'ust' ? 'ÜST' : 'ALT'} ${bahis.sov} @${oranYazi(bahis.oran)}${bahis.mbc > 1 ? ` (MBS ${bahis.mbc}, tek oynanmaz!)` : ''}\n` +
-          `Açık canlı baremler:\n${list.map(x => `  ${x.sov}  Alt ${oranYazi(x.alt)} / Üst ${oranYazi(x.ust)}`).join('\n')}\n` +
-          (k.skor ? `Skor: ${k.skor}\n` : '') +
-          `Kaynak: ${kaynak}\n` + link;
-        log(msg);
-        telegram(msg, link);
-        (db.uyarilar || (db.uyarilar = [])).unshift({
-          t: Date.now(), id: e.i, mac: `${k.hn} - ${k.an}`, esik: AYAR.FARK, yon, preRef: ref, canli: b.sov,
-          fark: +(b.sov - ref).toFixed(1), skor: k.skor || '', dk: oz ? oz.dk : null, kaynak,
-        });
-      }
-      kaydet();
     }
     kaydetIste();
   }
@@ -565,35 +606,44 @@
     const out = [];
     for (const [id, k] of Object.entries(db.mac)) {
       for (const b of Object.values(k.sanal || {})) {
-        if (b.ters) out.push(Object.assign({ id, mac: `${k.hn} - ${k.an}`, bitti: !!k.bitti, toplam: k.sanalZaman ? k.sanalToplam : null, sonucKaynak: k.sonucKaynak || '' }, b));
+        // v3.3 ve öncesindeki bahislerde referans alanı yok → hepsi maç öncesi
+        if (b.ters) out.push(Object.assign({ id, mac: `${k.hn} - ${k.an}`, bitti: !!k.bitti, toplam: k.sanalZaman ? k.sanalToplam : null, sonucKaynak: k.sonucKaynak || '', referans: 'pre' }, b));
       }
     }
     return out.sort((a, b) => b.t - a.t);
   }
+  // Özet satırları: referans × eşik (her referans için güncel eşik satırı boş da olsa görünür)
   function sanalOzet(liste) {
-    return [...new Set([AYAR.FARK, ...liste.map(b => b.esik)])].map(esik => {
-      const xs = liste.filter(b => b.esik === esik).map(b => b.ters).filter(x => x.oran != null);
-      const biten = xs.filter(x => x.sonuc);
-      const kaz = biten.filter(x => x.sonuc === 'K').length;
-      const net = biten.reduce((a, x) => a + x.net, 0);
-      const ortOran = xs.length ? xs.reduce((a, x) => a + x.oran, 0) / xs.length : null;
-      return {
-        esik, toplam: xs.length, biten: biten.length, kaz, kay: biten.length - kaz,
-        yuzde: biten.length ? 100 * kaz / biten.length : null, ortOran, basabas: ortOran ? 100 / ortOran : null,
-        net, roi: biten.length ? 100 * net / (biten.length * AYAR.SANAL_TUTAR) : null,
-      };
-    });
+    const satirlar = [];
+    for (const r of [...new Set([...AYAR.REFERANSLAR, ...liste.map(b => b.referans)])]) {
+      const lr = liste.filter(b => b.referans === r);
+      for (const esik of [...new Set([AYAR.FARK, ...lr.map(b => b.esik)])]) {
+        const xs = lr.filter(b => b.esik === esik).map(b => b.ters).filter(x => x.oran != null);
+        const biten = xs.filter(x => x.sonuc);
+        const kaz = biten.filter(x => x.sonuc === 'K').length;
+        const net = biten.reduce((a, x) => a + x.net, 0);
+        const ortOran = xs.length ? xs.reduce((a, x) => a + x.oran, 0) / xs.length : null;
+        satirlar.push({
+          referans: r, esik, toplam: xs.length, biten: biten.length, kaz, kay: biten.length - kaz,
+          yuzde: biten.length ? 100 * kaz / biten.length : null, ortOran, basabas: ortOran ? 100 / ortOran : null,
+          net, roi: biten.length ? 100 * net / (biten.length * AYAR.SANAL_TUTAR) : null,
+        });
+      }
+    }
+    return satirlar;
   }
   function sanalCSV() {
     const bas = ['zaman', 'mac_id', 'mac', 'lig', 'esik', 'mac_dakikasi', 'gecen_sure', 'ceyrek', 'ceyrek_kalan', 'barem_yonu',
       'mac_oncesi_ana', 'mac_oncesi_en_alt', 'mac_oncesi_en_ust', 'karsilastirilan', 'fark', 'skor_aninda',
-      'taraf', 'barem', 'oran', 'mbs', 'toplam_sayi', 'sonuc', 'net_tl', 'kontrol_et', 'sonuc_kaynagi', 'veri_kaynagi'];
+      'taraf', 'barem', 'oran', 'mbs', 'toplam_sayi', 'sonuc', 'net_tl', 'kontrol_et', 'sonuc_kaynagi', 'veri_kaynagi',
+      'referans', 'referans_gecen_sure', 'referans_en_alt', 'referans_en_ust'];   // v3.4: yeni sütunlar sonda (eski dosyalarla uyumlu)
     const sat = [bas.join(';')];
     for (const b of sanalListe()) {
       const x = b.ters;
       sat.push([new Date(b.t).toLocaleString('tr-TR'), b.id, b.mac, b.lig || '', b.esik, b.dk ?? '', b.gecen || '', b.ceyrek ?? '', b.ceyrekKalan || b.kalan || '',
-        b.yon === 'ust' ? 'yukari' : 'asagi', b.pre, b.preAlt ?? '', b.preUst ?? '', b.preRef ?? '', b.fark, b.skor,
-        x.taraf === 'ust' ? 'UST' : 'ALT', x.sov, x.oran, x.mbc ?? '', b.toplam ?? '', x.sonuc ?? '', x.net ?? '', x.yakin ? 'evet' : '', b.sonucKaynak, b.kaynak]
+        b.yon === 'ust' ? 'yukari' : 'asagi', b.pre ?? '', b.preAlt ?? '', b.preUst ?? '', b.preRef ?? '', b.fark, b.skor,
+        x.taraf === 'ust' ? 'UST' : 'ALT', x.sov, x.oran, x.mbc ?? '', b.toplam ?? '', x.sonuc ?? '', x.net ?? '', x.yakin ? 'evet' : '', b.sonucKaynak, b.kaynak,
+        b.referans, b.refGecen || '', b.refAlt ?? b.preAlt ?? '', b.refUst ?? b.preUst ?? '']
         .map(v => String(v).replace(/;/g, ',')).join(';'));
     }
     return '\uFEFF' + sat.join('\n');
@@ -678,7 +728,7 @@
     };
     girdi.onchange = uygula;
     girdi.onkeydown = (ev) => { if (ev.key === 'Enter') uygula(); };
-    ayarSatir.append(el('span', '', 'Fark eşiği:'), girdi, el('span', 'color:#9ca3af;', 'sayı (maç öncesi uç bareme göre)'), onay);
+    ayarSatir.append(el('span', '', 'Fark eşiği:'), girdi, el('span', 'color:#9ca3af;', 'sayı (maç öncesi, 5. dk ve 1. çeyrek uç baremlerine göre)'), onay);
     ust = el('div', 'padding:6px 10px 0;');
     govde = el('div', 'padding:6px 10px 10px;max-height:45vh;overflow:auto;');
     farkGirdi = girdi;
@@ -718,6 +768,13 @@
   const ipucu = (txt) => govde.append(el('div', 'color:#6b7280;margin-top:6px;', txt));
   const ac = (id) => () => { acik[id] = !acik[id]; cizIste(); };
   const preYazi = (k) => (k.pre == null ? 'yok' : k.preAlt != null && k.preAlt !== k.preUst ? `${k.preAlt}–${k.preUst}` : String(k.pre));
+  // Canlı sekmesi detayı: her referansın uç baremleri ve şu anki farklar
+  const refOzet = (k) => AYAR.REFERANSLAR.map(r => {
+    const x = refDeger(k, r), f = (k.refFark || {})[r], ham = r === 'pre' ? null : (k.ref || {})[r];
+    const ad = `${REF_AD[r]}${ham && ham.gecen ? ` (${ham.gecen})` : ''}`;
+    if (!x) return `  ${ad}: ${r === 'pre' ? 'yok' : ham && ham.kacti ? 'kaçırıldı (geç görüldü)' : 'bekleniyor'}`;
+    return `  ${ad}: ${x.alt}–${x.ust}${f ? ` · ÜST fark ${isaretli(f.ust)} / ALT fark ${isaretli(f.alt)}` : ''}`;
+  }).join('\n');
 
   function cizCanli(list) {
     if (!list.length) return bos('Şu an canlı basketbol maçı yok.');
@@ -731,11 +788,12 @@
           k.canliZaman ? `${Math.round((Date.now() - k.canliZaman) / 1000)} sn` : '-'],
         tik: ac(k.id),
         ek: acik[k.id] ? `${k.lig || ''}\nMaç öncesi: en alt ${k.preAlt ?? '-'} · ana ${k.pre ?? '-'} · en üst ${k.preUst ?? '-'}\n\n` +
+          `Referanslar (her biri ayrı sanal kupon açar):\n${refOzet(k)}\n\n` +
           `Açık canlı baremler:\n${(k.canliBaremler || []).map(x => `  ${x.sov}  Alt ${oranYazi(x.alt)} / Üst ${oranYazi(x.ust)}`).join('\n') || '  -'}\n\n` +
           `Canlı alt–üst geçmişi:\n${gecmisYazi(k.canliGecmis, 20)}` : null,
       };
     }));
-    ipucu(`ÜST fark = canlı en üst − maç öncesi en üst; ALT fark = canlı en alt − maç öncesi en alt. Eşik ±${AYAR.FARK}. Satıra tıklayınca baremler ve oranlar açılır.`);
+    ipucu(`ÜST fark = canlı en üst − maç öncesi en üst; ALT fark = canlı en alt − maç öncesi en alt. Eşik ±${AYAR.FARK}. Satıra tıklayınca 5. dk ve 1. çeyrek referansları, baremler ve oranlar açılır.`);
   }
 
   function cizYaklasan(list) {
@@ -756,14 +814,14 @@
         k.sanalZaman && k.sanalToplam != null ? `${k.sanalToplam} (${k.sonucKaynak})` : (k.skor || '-'), preYazi(k),
         { t: k.maxUst != null && isFinite(k.maxUst) ? isaretli(k.maxUst) : '-', css: k.maxUst >= AYAR.FARK ? KIRMIZI : '' },
         { t: k.minAlt != null && isFinite(k.minAlt) ? isaretli(k.minAlt) : '-', css: -k.minAlt >= AYAR.FARK ? KIRMIZI : '' },
-        k.sanal && Object.keys(k.sanal).length ? '✓' : '–'],
+        k.sanal && Object.keys(k.sanal).length ? String(Object.keys(k.sanal).length) : '–'],
     })));
   }
 
   function cizUyari(list) {
     if (!list.length) return bos('Henüz uyarı gönderilmedi.');
     tablo(['Zaman', 'Maç', 'Eşik', 'Dk', 'Yön', 'Barem', 'Fark', 'Skor', 'Kaynak'], list.map(u => ({
-      h: [`${gun(u.t)} ${saatSn(u.t)}`, { t: u.mac, wrap: true }, u.esik ? `±${u.esik}` : '-', u.dk ? `${u.dk}'` : '-',
+      h: [`${gun(u.t)} ${saatSn(u.t)}`, { t: u.mac, wrap: true }, u.esik ? `±${u.esik}${u.referans && u.referans !== 'pre' ? ` · ${REF_AD[u.referans]}` : ''}` : '-', u.dk ? `${u.dk}'` : '-',
         u.yon === 'ust' ? 'YUKARI' : 'AŞAĞI', `${u.preRef ?? u.pre} → ${u.canli}`, { t: isaretli(u.fark), css: KIRMIZI }, u.skor || '-', u.kaynak],
     })));
   }
@@ -785,27 +843,29 @@
     const tl = (x) => `${x > 0 ? '+' : ''}${Math.round(x).toLocaleString('tr-TR')} TL`;
     const renk = (x) => (x > 0 ? YESIL : x < 0 ? KIRMIZI : '');
     govde.append(el('div', 'color:#9ca3af;margin-bottom:4px;',
-      `Her bahis ${AYAR.SANAL_TUTAR.toLocaleString('tr-TR')} TL. Ters: barem yukarı kaçınca en üst baremde ALT, aşağı kaçınca en alt baremde ÜST.`));
-    tablo(['Eşik', 'Bahis', 'Biten', 'K-Y', 'Kazanma', 'Başabaş', 'Ort. oran', 'Net', 'ROI'], sanalOzet(list).map(r => ({
-      h: [`±${r.esik}`, r.toplam, r.biten, `${r.kaz}-${r.kay}`, r.yuzde == null ? '-' : `${yz(r.yuzde)}%`,
+      `Her bahis ${AYAR.SANAL_TUTAR.toLocaleString('tr-TR')} TL. Ters: barem yukarı kaçınca en üst baremde ALT, aşağı kaçınca en alt baremde ÜST. ` +
+      `Fark üç referansa göre ayrı ölçülür (maç öncesi, 5. dk, 1. çeyrek sonu); Telegram sadece ${AYAR.UYARI_REFERANSLAR.map(r => REF_AD[r].toLowerCase()).join(', ')} için gider.`));
+    tablo(['Referans', 'Eşik', 'Bahis', 'Biten', 'K-Y', 'Kazanma', 'Başabaş', 'Ort. oran', 'Net', 'ROI'], sanalOzet(list).map(r => ({
+      h: [REF_AD[r.referans] || r.referans, `±${r.esik}`, r.toplam, r.biten, `${r.kaz}-${r.kay}`, r.yuzde == null ? '-' : `${yz(r.yuzde)}%`,
         r.basabas == null ? '-' : `${yz(r.basabas)}%`, yz(r.ortOran, 2),
         { t: r.biten ? tl(r.net) : '-', css: renk(r.net) }, { t: r.roi == null ? '-' : `${yz(r.roi)}%`, css: renk(r.roi || 0) }],
     })));
     if (!list.length) return bos(`Henüz sanal bahis yok. ±${AYAR.FARK} geçildiğinde burada birikecek.`);
     govde.append(el('div', 'height:10px'));
-    tablo(['Zaman', 'Maç', 'Eşik', 'Dk', 'Hareket', 'Bahis', 'Toplam'], list.map(b => {
-      const x = b.ters, key = `s${b.id}_${b.esik}_${b.yon}`;
+    tablo(['Zaman', 'Maç', 'Ref', 'Eşik', 'Dk', 'Hareket', 'Bahis', 'Toplam'], list.map(b => {
+      const x = b.ters, key = `s${b.id}_${b.referans}_${b.esik}_${b.yon}`;
       const sonucHucre = b.toplam != null
         ? { t: `${b.toplam}${x.yakin ? ' ⚠' : ''}`, tik: () => sonucGir(b.id) }
         : b.bitti ? { t: 'sonuç gir', css: 'color:#fbbf24;', tik: () => sonucGir(b.id) } : 'oynanıyor';
       return {
-        h: [`${gun(b.t)} ${saat(b.t)}`, { t: b.mac, wrap: true }, `±${b.esik}`, b.dk ? `${b.dk}'` : '-',
+        h: [`${gun(b.t)} ${saat(b.t)}`, { t: b.mac, wrap: true }, REF_AD[b.referans] || b.referans, `±${b.esik}`, b.dk ? `${b.dk}'` : '-',
           `${b.preRef ?? b.pre} ${b.yon === 'ust' ? '↑ +' : '↓ -'}${b.fark}`,
           { t: `${x.taraf === 'ust' ? 'ÜST' : 'ALT'} ${x.sov} @${oranYazi(x.oran)}${x.sonuc ? (x.sonuc === 'K' ? ' ✓' : ' ✗') : ''}`,
             css: x.sonuc === 'K' ? 'color:#34d399;' : x.sonuc === 'Y' ? 'color:#f87171;' : '' },
           sonucHucre],
         tik: ac(key),
-        ek: acik[key] ? `${b.lig || ''}\nEşik anı: ${b.dkYazi || '-'} · skor ${b.skor || '-'} · ${b.kaynak}\nSonuç kaynağı: ${b.sonucKaynak || '-'}\n` +
+        ek: acik[key] ? `${b.lig || ''}\nReferans: ${REF_AD[b.referans] || b.referans}${b.refGecen ? ` (${b.refGecen})` : ''} en alt–en üst ${b.refAlt ?? b.preAlt ?? '-'}–${b.refUst ?? b.preUst ?? '-'}` +
+          ` · maç öncesi ${b.preAlt ?? '-'}–${b.preUst ?? '-'}\nEşik anı: ${b.dkYazi || '-'} · skor ${b.skor || '-'} · ${b.kaynak}\nSonuç kaynağı: ${b.sonucKaynak || '-'}\n` +
           `Açık baremler:\n${(b.baremler || []).map(y => `  ${y.sov}  Alt ${oranYazi(y.alt)} / Üst ${oranYazi(y.ust)}  MBS ${y.mbc ?? '-'}`).join('\n')}` : null,
       };
     }));
@@ -853,7 +913,7 @@
   }
 
   // ---------- başlat ----------
-  window.iddaa13 = { db: () => db, durum, AYAR, sanalListe, sanalOzet, sanalCSV, oyunZamani }; // konsoldan inceleme için
+  window.iddaa13 = { db: () => db, durum, AYAR, sanalListe, sanalOzet, sanalCSV, oyunZamani, refDeger }; // konsoldan inceleme için
   bakim();
   kaydet();
   panelKur();
