@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         iddaa 13 Kuralı - Canlı Basketbol Barem Uyarısı
 // @namespace    iddaa-13-kurali
-// @version      3.5
-// @description  Canlı basketbol "Toplam Sayı Alt/Üst": canlı uç barem, referans uç baremden (maç öncesi / 5. dk / 1. çeyrek sonu) FARK kadar sapınca sanal kupon (Ters) + maç öncesi için Telegram uyarısı.
+// @version      3.6
+// @description  Canlı basketbol "Toplam Sayı Alt/Üst": canlı uç barem, referans uç baremden (maç öncesi / 5. dk / 1. çeyrek sonu) FARK kadar sapınca sanal kupon (Ters) + seçilen referanslar için Telegram uyarısı.
 // @match        https://www.iddaa.com/*
 // @grant        none
 // @run-at       document-idle
@@ -23,7 +23,8 @@
     // ---- referanslar: fark bu noktalardaki uç baremlere göre AYRI AYRI ölçülür, her biri kendi sanal kuponunu açar ----
     //   pre = maç öncesi son görüntü · dk5 = 5:00 oynandığında canlı · c1 = 1. çeyrek bittiğinde canlı
     REFERANSLAR: ['pre', 'dk5', 'c1'],
-    UYARI_REFERANSLAR: ['pre'],  // Telegram'a sadece bunlar gider; diğerleri sessizce sanal kupona yazılır
+    UYARI_REFERANSLAR: ['dk5'],  // Telegram'a sadece bunlar gider, diğerleri sessizce kupona yazılır. Varsayılan;
+                                 // paneldeki "Telegram uyarısı" kutuları bunun yerine geçer (bu tarayıcıda saklanır)
     REF_TOLERANS_SN: 180,        // dk5 / c1 anı bu kadar oyun saniyesi geçtikten sonra görülürse (script geç açıldı vb.) o maçta atlanır
     CANLI_KONTROL_SN: 15,      // canlı liste kontrolü (WebSocket'e ek, yedek)
     MAC_ONCESI_KONTROL_SN: 60, // maç öncesi baremlerin kaydı
@@ -42,7 +43,7 @@
   if (window.top !== window || window.__iddaa13) return;
   window.__iddaa13 = true;
 
-  const VERSIYON = '3.5';
+  const VERSIYON = '3.6';
   const API = 'https://sportsbookv2.iddaa.com/sportsbook';
   const SR = 'https://stats.fn.sportradar.com/sansgirisimnew/tr/Europe:Istanbul/gismo'; // iddaa'nın kullandığı Sportradar verisi
   const WS_ORAN = 'wss://sportsbooksocket.iddaa.com/sportsBookHubLite';  // currentOdds / currentEvents
@@ -54,6 +55,9 @@
   const KEY = 'iddaa13_v1';
   const FARK_KEY = 'iddaa13_fark';
   const REF_AD = { pre: 'Maç öncesi', dk5: '5. dk', c1: '1. çeyrek' };
+  const UYARI_KEY = 'iddaa13_uyari_ref';
+  try { const u = JSON.parse(localStorage.getItem(UYARI_KEY)); if (Array.isArray(u)) AYAR.UYARI_REFERANSLAR = AYAR.REFERANSLAR.filter(r => u.includes(r)); } catch (e) { /* */ }
+  const uyariYazi = () => (AYAR.UYARI_REFERANSLAR.length ? `Telegram uyarısı: ${AYAR.UYARI_REFERANSLAR.map(r => REF_AD[r]).join(', ')}` : 'Telegram uyarısı kapalı');
   const log = (...a) => console.log('%c[13 Kuralı]', 'color:#e67e22;font-weight:bold', ...a);
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const VARSAYILAN_FARK = AYAR.FARK;
@@ -382,7 +386,8 @@
         const sapma = yon === 'ust' ? f.ust : -f.alt;           // ilgili yöndeki sapma (pozitif)
         if (!(sapma >= AYAR.FARK)) continue;
         const anahtar = r === 'pre' ? `${AYAR.FARK}_${yon}` : `${r}_${AYAR.FARK}_${yon}`; // pre: eski anahtar biçimi korunur
-        if (sk[anahtar] && (ue[anahtar] || !uyariAcik)) continue;
+        if (sk[anahtar]) continue;                               // her yön için tek bahis; uyarı sadece bahis açıldığı anda gider
+                                                                 // (ayar sonradan açılırsa eski bahisler için toplu uyarı gitmez)
         const b = yon === 'ust' ? enUst : enAlt;
         const karsi = yon === 'ust' ? ref.ust : ref.alt;         // karşılaştırılan referans barem
         const oz = oyunZamani(k);
@@ -391,15 +396,13 @@
           ? { taraf: 'alt', sov: enUst.sov, oran: enUst.alt, mbc: enUst.mbc }
           : { taraf: 'ust', sov: enAlt.sov, oran: enAlt.ust, mbc: enAlt.mbc };
 
-        if (!sk[anahtar]) {
-          sk[anahtar] = {
-            t: Date.now(), referans: r, refAlt: ref.alt, refUst: ref.ust, refGecen: r === 'pre' ? '' : ref.gecen,
-            esik: AYAR.FARK, yon, pre: k.pre, preAlt: k.preAlt ?? k.pre, preUst: k.preUst ?? k.pre, preRef: karsi, fark: sapma,
-            skor: k.skor || '', lig: k.lig || '', kaynak, baremler: list,
-            dk: oz ? oz.dk : null, dkYazi: oz ? oz.yazi : '', gecen: oz ? oz.gecen : '', ceyrek: oz ? oz.ceyrek : null, ceyrekKalan: oz ? oz.kalan : '',
-            ters: bahis,
-          };
-        }
+        sk[anahtar] = {
+          t: Date.now(), referans: r, refAlt: ref.alt, refUst: ref.ust, refGecen: r === 'pre' ? '' : ref.gecen,
+          esik: AYAR.FARK, yon, pre: k.pre, preAlt: k.preAlt ?? k.pre, preUst: k.preUst ?? k.pre, preRef: karsi, fark: sapma,
+          skor: k.skor || '', lig: k.lig || '', kaynak, baremler: list,
+          dk: oz ? oz.dk : null, dkYazi: oz ? oz.yazi : '', gecen: oz ? oz.gecen : '', ceyrek: oz ? oz.ceyrek : null, ceyrekKalan: oz ? oz.kalan : '',
+          ters: bahis,
+        };
         if (uyariAcik && !ue[anahtar]) {
           ue[anahtar] = { t: Date.now() };
           const link = macLinki(e.i);
@@ -409,7 +412,8 @@
             `13 KURALI · ±${AYAR.FARK} (${yon === 'ust' ? 'barem YUKARI' : 'barem AŞAĞI'})${r === 'pre' ? '' : ` · referans ${REF_AD[r]}`}\n` +
             `${k.hn} - ${k.an}${k.lig ? `\n${k.lig}` : ''}\n` +
             `Maç dakikası: ${oz ? oz.yazi : 'bilinmiyor'}\n` +
-            (r === 'pre' ? `Maç öncesi baremler: ${ref.alt}–${ref.ust} (ana ${k.pre})\n` : `${REF_AD[r]} baremleri (${ref.gecen} oynandığında): ${ref.alt}–${ref.ust}\n`) +
+            (r === 'pre' ? `Maç öncesi baremler: ${ref.alt}–${ref.ust} (ana ${k.pre})\n`
+              : `${REF_AD[r]} baremleri (${ref.gecen} oynandığında): ${ref.alt}–${ref.ust}\n` + (k.pre != null ? `Maç öncesi baremler: ${k.preAlt ?? k.pre}–${k.preUst ?? k.pre}\n` : '')) +
             `Canlı en ${enAd} barem: ${b.sov} → ${refAd} en ${enAd} ${karsi}'e göre ${isaretli(+(b.sov - karsi).toFixed(1))}\n` +
             `>> TERS BAHİS: ${bahis.taraf === 'ust' ? 'ÜST' : 'ALT'} ${bahis.sov} @${oranYazi(bahis.oran)}${bahis.mbc > 1 ? ` (MBS ${bahis.mbc}, tek oynanmaz!)` : ''}\n` +
             `Açık canlı baremler:\n${list.map(x => `  ${x.sov}  Alt ${oranYazi(x.alt)} / Üst ${oranYazi(x.ust)}`).join('\n')}\n` +
@@ -783,11 +787,11 @@
         if (c == null) return;
         try { localStorage.setItem(TG_TOKEN_KEY, t.trim()); localStorage.setItem(TG_CHAT_KEY, c.trim()); } catch (e) { /* */ }
         if (!tokenVar()) window.alert('Token veya chat ID biçimi hatalı görünüyor. Tekrar deneyin.');
-        else telegram(`13 Kuralı takip (v${VERSIYON}) bu cihazda bağlandı. Fark eşiği: ±${AYAR.FARK}.`);
+        else telegram(`13 Kuralı takip (v${VERSIYON}) bu cihazda bağlandı. Fark eşiği: ±${AYAR.FARK}. ${uyariYazi()}.`);
         cizIste();
       }),
       btn('Test mesajı', async (b) => {
-        const ok = await telegram(`13 Kuralı takip (v${VERSIYON}) çalışıyor. Fark eşiği: ±${AYAR.FARK}.`, 'https://www.iddaa.com/program/canli/basketbol');
+        const ok = await telegram(`13 Kuralı takip (v${VERSIYON}) çalışıyor. Fark eşiği: ±${AYAR.FARK}. ${uyariYazi()}.`, 'https://www.iddaa.com/program/canli/basketbol');
         b.textContent = ok ? 'Gönderildi ✓' : 'Ayar eksik/hata';
         setTimeout(() => (b.textContent = 'Test mesajı'), 3000);
       }));
@@ -813,7 +817,28 @@
     ust = el('div', 'padding:6px 10px 0;');
     govde = el('div', 'padding:6px 10px 10px;max-height:45vh;overflow:auto;');
     farkGirdi = girdi;
-    icerik.append(ayarSatir, ust, govde);
+    // Telegram uyarısı: hangi kupon varyasyonları telefona gelsin (bu tarayıcıda saklanır)
+    const uyariSatir = el('div', 'display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:4px 10px 0;color:#d1d5db;');
+    const uyariOnay = el('span', 'color:#6b7280;', '');
+    uyariSatir.append(el('span', '', 'Telegram uyarısı:'));
+    for (const r of AYAR.REFERANSLAR) {
+      const kutu = el('input', 'margin:0;cursor:pointer;accent-color:#e67e22;');
+      kutu.type = 'checkbox';
+      kutu.checked = AYAR.UYARI_REFERANSLAR.includes(r);
+      kutu.onchange = () => {
+        AYAR.UYARI_REFERANSLAR = AYAR.REFERANSLAR.filter(x => (x === r ? kutu.checked : AYAR.UYARI_REFERANSLAR.includes(x)));
+        try { localStorage.setItem(UYARI_KEY, JSON.stringify(AYAR.UYARI_REFERANSLAR)); } catch (e) { /* */ }
+        uyariOnay.textContent = '✓ kaydedildi';
+        setTimeout(() => (uyariOnay.textContent = ''), 2000);
+        log(uyariYazi());
+        cizIste();
+      };
+      const etiket = el('label', 'display:flex;align-items:center;gap:4px;cursor:pointer;');
+      etiket.append(kutu, el('span', '', REF_AD[r]));
+      uyariSatir.append(etiket);
+    }
+    uyariSatir.append(el('span', 'color:#9ca3af;', 'işaretsizler sadece kupona yazılır'), uyariOnay);
+    icerik.append(ayarSatir, uyariSatir, ust, govde);
     bas.onclick = () => { icerik.style.display = icerik.style.display === 'none' ? '' : 'none'; };
     panel.append(bas, icerik);
     document.body.appendChild(panel);
@@ -956,7 +981,7 @@
     // ----- Karşılaştırma: referansların özeti + maç bazında yan yana -----
     if (kuponSekme === 'karsilastirma') {
       aciklama(`Aynı kural, ${refler.length} farklı referans: fark ${refler.map(r => REF_AD[r].toLowerCase()).join(', ')} uç baremlerine göre ayrı ölçülür ve her biri kendi kuponunu açar. ` +
-        `Her bahis ${AYAR.SANAL_TUTAR.toLocaleString('tr-TR')} TL, Ters. Telegram sadece ${AYAR.UYARI_REFERANSLAR.map(r => REF_AD[r].toLowerCase()).join(', ')} referansı için gider.`);
+        `Her bahis ${AYAR.SANAL_TUTAR.toLocaleString('tr-TR')} TL, Ters. ${uyariYazi()} (panelin üstündeki kutulardan değişir).`);
       ozetTablo(sanalOzet(list), true);
       if (!list.length) return bos(`Henüz sanal bahis yok. ±${AYAR.FARK} geçildiğinde burada birikecek.`);
       const maclar = new Map();                                  // liste yeniden eskiye sıralı → en son bahisli maç üstte
@@ -981,7 +1006,7 @@
     // ----- Tek varyasyon: kendi özeti + bahis listesi -----
     const r = kuponSekme, lr = list.filter(b => b.referans === r);
     aciklama(`${REF_AD[r] || r} kuponu: fark, ${REF_TABAN[r] || ''} en alt / en üst baremlere göre ölçülür. ` +
-      (AYAR.UYARI_REFERANSLAR.includes(r) ? 'Eşik geçilince Telegram uyarısı da gider.' : 'Telegram\'a gitmez, sadece buraya yazılır.') +
+      (AYAR.UYARI_REFERANSLAR.includes(r) ? 'Eşik geçilince Telegram uyarısı da gider.' : 'Telegram uyarısı kapalı, sadece buraya yazılır.') +
       ` Her bahis ${AYAR.SANAL_TUTAR.toLocaleString('tr-TR')} TL. Ters: barem yukarı kaçınca en üst baremde ALT, aşağı kaçınca en alt baremde ÜST.`);
     ozetTablo(sanalOzet(lr).filter(o => o.referans === r), false);
     if (!lr.length) return bos(`Bu varyasyonda henüz bahis yok. ${REF_AD[r] || r} referansına göre ±${AYAR.FARK} geçildiğinde burada birikecek.`);
@@ -1048,7 +1073,7 @@
   kaydet();
   panelKur();
   cizIste();
-  log(`v${VERSIYON} başladı. Fark eşiği: ±${AYAR.FARK}`);
+  log(`v${VERSIYON} başladı. Fark eşiği: ±${AYAR.FARK}. ${uyariYazi()}`);
   kontrolCek().then(() => ligleriYukle()).then(() => { macOncesiTara(); canliTara(); });
   zamanlayici(AYAR.KONTROL_SN * 1000, kontrolCek);
   zamanlayici(AYAR.MAC_ONCESI_KONTROL_SN * 1000, macOncesiTara);
